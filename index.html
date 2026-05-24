@@ -365,14 +365,19 @@
   }
 
   .hidden { display: none !important; }
+  /* Drive status colors */
+  #btnDrive.connected { background: #2ecc71; border-color: #2ecc71; color: white; }
+  #btnDrive.syncing { background: #ff8c00; border-color: #ff8c00; color: white; }
 </style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 
 <div class="topbar">
   <div class="logo">CowiFilms</div>
   <input class="project-name" id="projectName" value="Mi guion sin titulo" />
-  <span class="save-status" id="saveStatus">Guardado</span>
+  <span class="save-status" id="saveStatus">Guardado local</span>
+  <button class="btn" id="btnDrive">🔗 Conectar Drive</button>
 
   <div class="timer-box">
     <button class="timer-preset" data-min="15">15m</button>
@@ -384,8 +389,8 @@
   </div>
 
   <div class="topbar-actions">
-    <button class="btn" id="btnLoad">Cargar archivo</button>
-    <button class="btn btn-primary" id="btnSave">Guardar a Drive</button>
+    <button class="btn" id="btnLoad" title="Cargar un archivo .json manualmente">Cargar</button>
+    <button class="btn" id="btnSave" title="Descargar copia local">Descargar</button>
   </div>
 </div>
 
@@ -520,9 +525,21 @@
 
 <script>
 /* ============================================================
+   CONFIG GOOGLE DRIVE
+============================================================ */
+const GOOGLE_CLIENT_ID = "107267106305-97m7tahrgh20v46Il9sd5fmppiqhbrt5.apps.googleusercontent.com";
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const DRIVE_FILE_NAME = "cowifilms-project.json";
+
+let driveToken = null;          // access token
+let driveFileId = null;         // id del archivo en Drive
+let driveTokenClient = null;    // cliente OAuth
+let driveConnected = false;
+
+/* ============================================================
    ESTADO DEL PROYECTO
 ============================================================ */
-const STORAGE_KEY = "zepfilms-editor-v1";
+const STORAGE_KEY = "cowifilms-editor-v1";
 const TYPES_CYCLE = ["action", "scene", "character", "parenthetical", "dialogue", "transition"];
 
 let project = {
@@ -540,16 +557,22 @@ let currentView = "premisa";
    PERSISTENCIA
 ============================================================ */
 function save() {
+  // Siempre guardamos local como respaldo
   localStorage.setItem(STORAGE_KEY, JSON.stringify(project));
-  setSaveStatus("Guardado");
+  // Si Drive esta conectado, subimos tambien
+  if (driveConnected) {
+    saveToDrive();
+  } else {
+    setSaveStatus("Guardado local");
+  }
 }
 function setSaveStatus(text) {
   document.getElementById("saveStatus").textContent = text;
 }
 function scheduleSave() {
-  setSaveStatus("Guardando...");
+  setSaveStatus(driveConnected ? "Guardando en Drive..." : "Guardando...");
   clearTimeout(saveTimeout);
-  saveTimeout = setTimeout(save, 600);
+  saveTimeout = setTimeout(save, 800);
 }
 function load() {
   const raw = localStorage.getItem(STORAGE_KEY);
@@ -919,6 +942,182 @@ document.querySelectorAll(".timer-preset").forEach(btn => {
 });
 
 updateTimerDisplay();
+
+/* ============================================================
+   GOOGLE DRIVE API
+============================================================ */
+const btnDrive = document.getElementById("btnDrive");
+
+function setDriveStatus(state, text) {
+  btnDrive.classList.remove("connected", "syncing");
+  if (state === "connected") btnDrive.classList.add("connected");
+  if (state === "syncing") btnDrive.classList.add("syncing");
+  if (text) btnDrive.textContent = text;
+}
+
+function initDriveClient() {
+  if (!window.google || !google.accounts || !google.accounts.oauth2) {
+    setTimeout(initDriveClient, 300);
+    return;
+  }
+  driveTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: DRIVE_SCOPE,
+    callback: handleTokenResponse,
+  });
+}
+
+async function handleTokenResponse(resp) {
+  if (resp.error) {
+    alert("Error al conectar con Drive: " + resp.error);
+    return;
+  }
+  driveToken = resp.access_token;
+  driveConnected = true;
+  setDriveStatus("syncing", "🔄 Sincronizando...");
+  setSaveStatus("Conectado a Drive");
+
+  // Buscar o crear el archivo
+  try {
+    const existing = await findDriveFile();
+    if (existing) {
+      driveFileId = existing.id;
+      const cloudData = await downloadDriveFile(driveFileId);
+      if (cloudData) {
+        // Comparar con local: usar el mas reciente o priorizar nube
+        const useCloud = confirm(
+          "Se encontro un proyecto en tu Drive.\n\n" +
+          "Aceptar = Cargar el de Drive (descarta cambios locales no sincronizados)\n" +
+          "Cancelar = Subir el local a Drive (sobrescribe lo de Drive)"
+        );
+        if (useCloud) {
+          project = Object.assign(project, cloudData);
+          renderAll();
+        } else {
+          await uploadDriveFile();
+        }
+      }
+    } else {
+      // No existe -> crear
+      driveFileId = await createDriveFile();
+    }
+    setDriveStatus("connected", "✅ Drive conectado");
+    setSaveStatus("Sincronizado");
+    localStorage.setItem("cowifilms-drive-fileid", driveFileId);
+  } catch (err) {
+    console.error(err);
+    alert("Error al sincronizar con Drive: " + err.message);
+    setDriveStatus("", "🔗 Conectar Drive");
+    driveConnected = false;
+  }
+}
+
+async function findDriveFile() {
+  // Primero intentar con el ID guardado
+  const savedId = localStorage.getItem("cowifilms-drive-fileid");
+  if (savedId) {
+    try {
+      const r = await fetch(`https://www.googleapis.com/drive/v3/files/${savedId}?fields=id,name,trashed`, {
+        headers: { Authorization: "Bearer " + driveToken }
+      });
+      if (r.ok) {
+        const data = await r.json();
+        if (!data.trashed) return data;
+      }
+    } catch(e) {}
+  }
+  // Si no, buscar por nombre
+  const q = encodeURIComponent(`name='${DRIVE_FILE_NAME}' and trashed=false`);
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`, {
+    headers: { Authorization: "Bearer " + driveToken }
+  });
+  if (!r.ok) throw new Error("No se pudo consultar Drive");
+  const data = await r.json();
+  return data.files && data.files.length > 0 ? data.files[0] : null;
+}
+
+async function createDriveFile() {
+  const metadata = {
+    name: DRIVE_FILE_NAME,
+    mimeType: "application/json"
+  };
+  const body = new Blob([JSON.stringify(project, null, 2)], { type: "application/json" });
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  form.append("file", body);
+
+  const r = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + driveToken },
+    body: form
+  });
+  if (!r.ok) throw new Error("No se pudo crear el archivo en Drive");
+  const data = await r.json();
+  return data.id;
+}
+
+async function downloadDriveFile(fileId) {
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+    headers: { Authorization: "Bearer " + driveToken }
+  });
+  if (!r.ok) return null;
+  try { return await r.json(); } catch(e) { return null; }
+}
+
+let driveUploadInFlight = false;
+let driveUploadPending = false;
+async function saveToDrive() {
+  if (!driveConnected || !driveFileId) return;
+  if (driveUploadInFlight) { driveUploadPending = true; return; }
+  driveUploadInFlight = true;
+  setSaveStatus("Subiendo a Drive...");
+  try {
+    await uploadDriveFile();
+    setSaveStatus("Sincronizado " + new Date().toLocaleTimeString());
+  } catch (err) {
+    console.error(err);
+    setSaveStatus("Error en Drive (guardado local OK)");
+  }
+  driveUploadInFlight = false;
+  if (driveUploadPending) {
+    driveUploadPending = false;
+    saveToDrive();
+  }
+}
+
+async function uploadDriveFile() {
+  const body = JSON.stringify(project, null, 2);
+  const r = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`, {
+    method: "PATCH",
+    headers: {
+      Authorization: "Bearer " + driveToken,
+      "Content-Type": "application/json"
+    },
+    body: body
+  });
+  if (!r.ok) throw new Error("Fallo al actualizar el archivo en Drive");
+}
+
+btnDrive.addEventListener("click", () => {
+  if (!driveTokenClient) {
+    alert("Esperando que cargue Google. Probá de nuevo en unos segundos.");
+    return;
+  }
+  if (driveConnected) {
+    if (confirm("Ya estás conectado a Drive. ¿Querés desconectarte?")) {
+      driveConnected = false;
+      driveToken = null;
+      driveFileId = null;
+      localStorage.removeItem("cowifilms-drive-fileid");
+      setDriveStatus("", "🔗 Conectar Drive");
+      setSaveStatus("Guardado local");
+    }
+  } else {
+    driveTokenClient.requestAccessToken({ prompt: "consent" });
+  }
+});
+
+initDriveClient();
 
 /* ============================================================
    ARRANQUE
