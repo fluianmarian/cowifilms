@@ -368,6 +368,72 @@
   /* Drive status colors */
   #btnDrive.connected { background: #2ecc71; border-color: #2ecc71; color: white; }
   #btnDrive.syncing { background: #ff8c00; border-color: #ff8c00; color: white; }
+
+  /* Modal */
+  .modal-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    width: 90%;
+    max-width: 480px;
+    max-height: 80vh;
+    overflow-y: auto;
+  }
+  .modal h3 {
+    font-size: 16px;
+    margin-bottom: 16px;
+    color: var(--text);
+  }
+  .project-list { margin-bottom: 16px; }
+  .project-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    background: var(--panel-2);
+    margin-bottom: 6px;
+    border: 1px solid var(--border);
+  }
+  .project-item:hover { border-color: #ff8c00; }
+  .project-item.current { border-color: #2ecc71; }
+  .project-item-name { flex: 1; font-size: 14px; }
+  .project-item-actions { display: flex; gap: 4px; }
+  .project-item-actions button {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 4px 6px;
+    border-radius: 3px;
+  }
+  .project-item-actions button:hover { background: var(--border); color: var(--text); }
+  .project-item-actions .danger:hover { color: #ff6b6b; }
+  .modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 16px;
+  }
+  .empty-msg {
+    color: var(--muted);
+    font-size: 13px;
+    text-align: center;
+    padding: 20px;
+    font-style: italic;
+  }
 </style>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
@@ -377,6 +443,7 @@
   <div class="logo">CowiFilms</div>
   <input class="project-name" id="projectName" value="Mi guion sin titulo" />
   <span class="save-status" id="saveStatus">Guardado local</span>
+  <button class="btn" id="btnProjects">📂 Mis guiones</button>
   <button class="btn" id="btnDrive">🔗 Conectar Drive</button>
 
   <div class="timer-box">
@@ -523,13 +590,26 @@
 
 <input type="file" id="fileInput" accept=".json" style="display:none">
 
+<!-- Modal: Mis guiones -->
+<div class="modal-overlay" id="modalProjects">
+  <div class="modal">
+    <h3>Mis guiones</h3>
+    <div class="project-list" id="projectList"></div>
+    <div class="modal-actions">
+      <button class="btn" id="btnNewProject">+ Nuevo guion</button>
+      <button class="btn" id="btnCloseModal">Cerrar</button>
+    </div>
+  </div>
+</div>
+
 <script>
 /* ============================================================
    CONFIG GOOGLE DRIVE
 ============================================================ */
 const GOOGLE_CLIENT_ID = "107267106305-97m7tahrgh20v46ll9sd5fmppiqhbrt5.apps.googleusercontent.com";
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
-const DRIVE_FILE_NAME = "cowifilms-project.json";
+const DRIVE_FILE_NAME = "cowifilms-project.json"; // legacy single-file
+const DRIVE_FILE_EXT = ".cowifilms.json";          // nuevo formato multi-guion
 
 let driveToken = null;          // access token
 let driveFileId = null;         // id del archivo en Drive
@@ -977,33 +1057,45 @@ async function handleTokenResponse(resp) {
   setDriveStatus("syncing", "🔄 Sincronizando...");
   setSaveStatus("Conectado a Drive");
 
-  // Buscar o crear el archivo
   try {
-    const existing = await findDriveFile();
-    if (existing) {
-      driveFileId = existing.id;
-      const cloudData = await downloadDriveFile(driveFileId);
-      if (cloudData) {
-        // Comparar con local: usar el mas reciente o priorizar nube
+    // Listar todos los proyectos
+    const files = await listDriveProjects();
+    const savedId = localStorage.getItem("cowifilms-drive-fileid");
+
+    if (files.length === 0) {
+      // Sin proyectos en Drive: chequear si hay un viejo formato unico
+      const legacy = await findLegacyFile();
+      if (legacy) {
+        // Migrar nombre
+        driveFileId = legacy.id;
+        await renameDriveFile(driveFileId, sanitizeFileName(project.name || "Mi guion") + DRIVE_FILE_EXT);
+      } else {
+        // Crear primer proyecto con lo que haya local
+        driveFileId = await createDriveFile(project);
+      }
+    } else if (savedId && files.find(f => f.id === savedId)) {
+      // Tenia uno abierto -> cargarlo
+      driveFileId = savedId;
+      const cloud = await downloadDriveFile(driveFileId);
+      if (cloud) {
         const useCloud = confirm(
-          "Se encontro un proyecto en tu Drive.\n\n" +
-          "Aceptar = Cargar el de Drive (descarta cambios locales no sincronizados)\n" +
-          "Cancelar = Subir el local a Drive (sobrescribe lo de Drive)"
+          "Se encontró tu guion en Drive.\n\n" +
+          "Aceptar = Cargar el de Drive\n" +
+          "Cancelar = Subir el de esta PC (sobrescribe el de Drive)"
         );
-        if (useCloud) {
-          project = Object.assign(project, cloudData);
-          renderAll();
-        } else {
-          await uploadDriveFile();
-        }
+        if (useCloud) { project = Object.assign(emptyProject(), cloud); renderAll(); }
+        else { await uploadDriveFile(); }
       }
     } else {
-      // No existe -> crear
-      driveFileId = await createDriveFile();
+      // Multiples proyectos en Drive: abrir el primero por defecto
+      driveFileId = files[0].id;
+      const cloud = await downloadDriveFile(driveFileId);
+      if (cloud) { project = Object.assign(emptyProject(), cloud); renderAll(); }
     }
+
+    localStorage.setItem("cowifilms-drive-fileid", driveFileId);
     setDriveStatus("connected", "✅ Drive conectado");
     setSaveStatus("Sincronizado");
-    localStorage.setItem("cowifilms-drive-fileid", driveFileId);
   } catch (err) {
     console.error(err);
     alert("Error al sincronizar con Drive: " + err.message);
@@ -1012,36 +1104,62 @@ async function handleTokenResponse(resp) {
   }
 }
 
-async function findDriveFile() {
-  // Primero intentar con el ID guardado
-  const savedId = localStorage.getItem("cowifilms-drive-fileid");
-  if (savedId) {
-    try {
-      const r = await fetch(`https://www.googleapis.com/drive/v3/files/${savedId}?fields=id,name,trashed`, {
-        headers: { Authorization: "Bearer " + driveToken }
-      });
-      if (r.ok) {
-        const data = await r.json();
-        if (!data.trashed) return data;
-      }
-    } catch(e) {}
-  }
-  // Si no, buscar por nombre
+function emptyProject() {
+  return {
+    name: "Mi guion sin titulo",
+    premisa: { logline: "", tema: "", genero: "", sinopsis: "" },
+    personajes: [],
+    actos: { acto1: "", acto2: "", acto3: "" },
+    notas: ""
+  };
+}
+
+function sanitizeFileName(name) {
+  return (name || "guion").replace(/[\\/:*?"<>|]/g, "_").trim().substring(0, 80);
+}
+
+async function listDriveProjects() {
+  const q = encodeURIComponent(`name contains '${DRIVE_FILE_EXT}' and trashed=false`);
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc`, {
+    headers: { Authorization: "Bearer " + driveToken }
+  });
+  if (!r.ok) throw new Error("No se pudo listar Drive");
+  const data = await r.json();
+  return data.files || [];
+}
+
+async function findLegacyFile() {
   const q = encodeURIComponent(`name='${DRIVE_FILE_NAME}' and trashed=false`);
   const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`, {
     headers: { Authorization: "Bearer " + driveToken }
   });
-  if (!r.ok) throw new Error("No se pudo consultar Drive");
+  if (!r.ok) return null;
   const data = await r.json();
   return data.files && data.files.length > 0 ? data.files[0] : null;
 }
 
-async function createDriveFile() {
-  const metadata = {
-    name: DRIVE_FILE_NAME,
-    mimeType: "application/json"
-  };
-  const body = new Blob([JSON.stringify(project, null, 2)], { type: "application/json" });
+async function renameDriveFile(fileId, newName) {
+  await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: "Bearer " + driveToken,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ name: newName })
+  });
+}
+
+async function deleteDriveFile(fileId) {
+  await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+    method: "DELETE",
+    headers: { Authorization: "Bearer " + driveToken }
+  });
+}
+
+async function createDriveFile(projectData) {
+  const fname = sanitizeFileName(projectData.name || "Mi guion") + DRIVE_FILE_EXT;
+  const metadata = { name: fname, mimeType: "application/json" };
+  const body = new Blob([JSON.stringify(projectData, null, 2)], { type: "application/json" });
   const form = new FormData();
   form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
   form.append("file", body);
@@ -1114,6 +1232,132 @@ btnDrive.addEventListener("click", () => {
     }
   } else {
     driveTokenClient.requestAccessToken({ prompt: "consent" });
+  }
+});
+
+/* ============================================================
+   MODAL "MIS GUIONES"
+============================================================ */
+const modalProjects = document.getElementById("modalProjects");
+const projectListEl = document.getElementById("projectList");
+
+document.getElementById("btnProjects").addEventListener("click", openProjectsModal);
+document.getElementById("btnCloseModal").addEventListener("click", () => modalProjects.classList.remove("open"));
+modalProjects.addEventListener("click", (e) => { if (e.target === modalProjects) modalProjects.classList.remove("open"); });
+
+document.getElementById("btnNewProject").addEventListener("click", async () => {
+  const name = prompt("Nombre del nuevo guion:", "Nuevo guion");
+  if (!name) return;
+  // Guardar el actual antes de cambiar
+  if (driveConnected) await saveToDrive();
+
+  project = emptyProject();
+  project.name = name;
+  renderAll();
+
+  if (driveConnected) {
+    try {
+      driveFileId = await createDriveFile(project);
+      localStorage.setItem("cowifilms-drive-fileid", driveFileId);
+      setSaveStatus("Nuevo guion creado en Drive");
+    } catch (e) {
+      alert("Error creando guion en Drive: " + e.message);
+    }
+  } else {
+    save();
+  }
+  modalProjects.classList.remove("open");
+});
+
+async function openProjectsModal() {
+  projectListEl.innerHTML = "";
+  if (!driveConnected) {
+    projectListEl.innerHTML = '<div class="empty-msg">Conectá Drive para tener varios guiones.<br>Sin Drive, solo se guarda uno local.</div>';
+    modalProjects.classList.add("open");
+    return;
+  }
+  projectListEl.innerHTML = '<div class="empty-msg">Cargando...</div>';
+  modalProjects.classList.add("open");
+  try {
+    const files = await listDriveProjects();
+    if (files.length === 0) {
+      projectListEl.innerHTML = '<div class="empty-msg">No hay guiones todavía. Creá uno nuevo.</div>';
+      return;
+    }
+    projectListEl.innerHTML = "";
+    files.forEach(f => {
+      const displayName = f.name.replace(DRIVE_FILE_EXT, "");
+      const isCurrent = f.id === driveFileId;
+      const row = document.createElement("div");
+      row.className = "project-item" + (isCurrent ? " current" : "");
+      row.innerHTML = `
+        <span class="project-item-name">${escapeHtml(displayName)}${isCurrent ? " <small style='color:#2ecc71'>(actual)</small>" : ""}</span>
+        <div class="project-item-actions">
+          <button data-action="rename" title="Renombrar">✏️</button>
+          <button data-action="delete" class="danger" title="Eliminar">🗑️</button>
+        </div>
+      `;
+      row.querySelector(".project-item-name").addEventListener("click", async () => {
+        if (isCurrent) { modalProjects.classList.remove("open"); return; }
+        await switchToProject(f.id);
+        modalProjects.classList.remove("open");
+      });
+      row.querySelector('[data-action="rename"]').addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const newName = prompt("Nuevo nombre:", displayName);
+        if (!newName || newName === displayName) return;
+        await renameDriveFile(f.id, sanitizeFileName(newName) + DRIVE_FILE_EXT);
+        if (f.id === driveFileId) {
+          project.name = newName;
+          document.getElementById("projectName").value = newName;
+          await saveToDrive();
+        }
+        openProjectsModal();
+      });
+      row.querySelector('[data-action="delete"]').addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm(`¿Eliminar "${displayName}"? Esta acción no se puede deshacer.`)) return;
+        await deleteDriveFile(f.id);
+        if (f.id === driveFileId) {
+          // Era el actual: limpiar
+          driveFileId = null;
+          localStorage.removeItem("cowifilms-drive-fileid");
+          project = emptyProject();
+          renderAll();
+        }
+        openProjectsModal();
+      });
+      projectListEl.appendChild(row);
+    });
+  } catch (e) {
+    projectListEl.innerHTML = '<div class="empty-msg">Error: ' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+async function switchToProject(fileId) {
+  // Guardar el actual primero
+  if (driveConnected && driveFileId) {
+    try { await uploadDriveFile(); } catch(e) {}
+  }
+  setSaveStatus("Cambiando de guion...");
+  driveFileId = fileId;
+  localStorage.setItem("cowifilms-drive-fileid", fileId);
+  const cloud = await downloadDriveFile(fileId);
+  if (cloud) {
+    project = Object.assign(emptyProject(), cloud);
+    renderAll();
+    setSaveStatus("Cargado");
+  }
+}
+
+// Cuando el usuario cambia el nombre del proyecto, renombrar tambien el archivo de Drive
+let renameTimeout = null;
+document.getElementById("projectName").addEventListener("blur", async () => {
+  if (driveConnected && driveFileId) {
+    clearTimeout(renameTimeout);
+    try {
+      await renameDriveFile(driveFileId, sanitizeFileName(project.name) + DRIVE_FILE_EXT);
+    } catch(e) {}
   }
 });
 
